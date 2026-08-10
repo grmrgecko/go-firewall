@@ -1,0 +1,36 @@
+version: "2"
+
+# go-firewall is a multi-platform library: each backend lives behind a GOOS
+# build tag (iptables/nft/ufw/firewalld/csf/apf on linux, pf on darwin+freebsd,
+# wf on windows). golangci-lint only analyzes one GOOS per run, so the firewall
+# is linted once per platform — see the `lint` target in the Makefile, which is
+# the canonical entry point.
+#
+# The linux run is authoritative for the `unused` linter: linux compiles every
+# linux backend plus the shared helpers, so it alone can tell dead code from a
+# helper that only a subset of backends use. The cross-compiled runs disable
+# `unused` (a linux-only helper unavoidably reads as dead code under another
+# GOOS) but keep errcheck/govet/ineffassign/staticcheck.
+#
+# The gap that leaves: a shared helper called only from pf.go (darwin/freebsd)
+# or wf_windows.go reads as dead under the one run that judges dead code. Those
+# carry a `//nolint:unused` naming the backend that needs them — check the
+# caller before deleting one.
+
+run:
+  # Analyze test files too, so the integration suites are held to the same bar.
+  tests: true
+
+linters:
+  # The conservative standard set: errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+
+issues:
+  # Report every occurrence; the defaults cap repeats and hide real work.
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  # Enforce canonical gofmt formatting as part of the same run.
+  enable:
+    - gofmt

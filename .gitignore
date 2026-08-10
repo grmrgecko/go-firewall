@@ -1,0 +1,15 @@
+# Integration-test VM cache (base cloud image, overlay disk, cloud-init seed,
+# serial console log). Created by the test/integration/host-*-vm.sh scripts; removed by `make clean`.
+/.cache/
+
+# Build output for the go-firewall CLI (see `make cli`). Removed by `make clean`.
+/build/
+
+# Stray CLI binary from a bare `go build` inside the cmd module (the binary name
+# matches the directory). The canonical build target is /build/ above.
+/cmd/go-firewall/go-firewall
+/cmd/go-firewall/go-firewall.exe
+
+# Bytecode cache Python writes when the refactor helpers in scripts/ are run.
+/scripts/__pycache__/
+

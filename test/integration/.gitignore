@@ -1,0 +1,2 @@
+# Test binary compiled by host-linux-vm.sh and run natively inside the VM.
+firewall.test
