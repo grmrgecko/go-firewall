@@ -19,6 +19,10 @@ type FirewallD struct {
 	// backends. firewalld organizes rules into zones rather than a private
 	// namespace, so the prefix is not applied to individual rules.
 	rulePrefix string
+	// noPriority is set for firewalld older than 0.7, whose rich rules have
+	// no priority attribute and are refused when they carry one (EL7 ships
+	// 0.6).
+	noPriority bool
 }
 
 // fwICMPv4Types maps firewalld's IPv4 icmp-type names to their numeric ICMP type,
@@ -70,7 +74,9 @@ func NewFirewallD(ctx context.Context, rulePrefix string) (*FirewallD, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("firewalld cannot be reached: %s", err)
 	}
-	return &FirewallD{Conn: conn, rulePrefix: rulePrefix}, nil
+	v := conn.Version()
+	noPriority := v.Raw != "" && v.Major == 0 && v.Minor < 7
+	return &FirewallD{Conn: conn, rulePrefix: rulePrefix, noPriority: noPriority}, nil
 }
 
 // Type returns the backend identifier for firewalld.
@@ -83,7 +89,7 @@ func (f *FirewallD) Capabilities() Capabilities {
 	return Capabilities{
 		Output:   false,
 		Zones:    true,
-		Priority: true,
+		Priority: !f.noPriority,
 		IPv6:     true,
 		// A rich rule carries a single port element, so a source-port match
 		// cannot be combined with a destination-port match in one rule.
@@ -685,8 +691,9 @@ func (f *FirewallD) MarshalRichRule(r *Rule) (richRule string, err error) {
 	// Start with the base rule.
 	parts := []string{"rule"}
 
-	// Add priority.
-	if r.Priority != 0 {
+	// Add priority, which firewalld before 0.7 cannot express. As on the
+	// backends without per-rule priority, it is left out rather than refused.
+	if r.Priority != 0 && !f.noPriority {
 		parts = append(parts, fmt.Sprintf(`priority="%d"`, r.Priority))
 	}
 

@@ -615,3 +615,26 @@ func TestFirewallDModeledForwardPort(t *testing.T) {
 	require.Nil(t, fw.modeledForwardPort(firewalld.ForwardPort{Port: "9999", Protocol: "dccp"}))
 	require.Nil(t, fw.modeledForwardPort(firewalld.ForwardPort{Port: "8080", Protocol: "tcp", ToPort: "8080-8090", ToAddr: "10.0.0.5"}))
 }
+
+// Validate that firewalld older than 0.7, which has no rich rule priority,
+// gets rules without one and does not advertise the capability.
+func TestFirewallDPriorityGate(t *testing.T) {
+	rule := &Rule{Priority: 10, Family: IPv6, Port: 4789, Proto: UDP, Action: Accept}
+	tests := []struct {
+		name       string
+		noPriority bool
+		want       string
+	}{
+		{"Supported", false, `rule priority="10" family="ipv6" port port="4789" protocol="udp" accept`},
+		{"Unsupported", true, `rule family="ipv6" port port="4789" protocol="udp" accept`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fw := &FirewallD{noPriority: tt.noPriority}
+			got, err := fw.MarshalRichRule(rule)
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+			require.Equal(t, !tt.noPriority, fw.Capabilities().Priority)
+		})
+	}
+}
