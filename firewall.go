@@ -975,10 +975,13 @@ func expandNATPorts(r *NATRule) []*NATRule {
 // role-swaps the outbound half, so each cell is stated in its own natural frame —
 // covers compares in the inbound frame, so that swap round-trips. On a backend with
 // no output concept (outputSupported false) the direction axis does not distinguish
-// two rules, so it is not expanded. The port axis expands a list to one cell per
-// spec, keeping each range whole, so a stored set of single-port rows covers a
-// list rule on a backend that fans lists out (firewalld, pf).
-func (r *Rule) cells(outputSupported bool) []*Rule {
+// two rules, so it is not expanded. On a backend that does not manage IPv6
+// (ipv6Supported false) a family-agnostic rule spans only its IPv4 cell, since that
+// is all the backend can store for it; a rule pinned to IPv6 keeps its cell. The
+// port axis expands a list to one cell per spec, keeping each range whole, so a
+// stored set of single-port rows covers a list rule on a backend that fans lists
+// out (firewalld, pf).
+func (r *Rule) cells(outputSupported, ipv6Supported bool) []*Rule {
 	dirs := []*Rule{r}
 	if outputSupported {
 		dirs = expandDirections(r)
@@ -986,7 +989,7 @@ func (r *Rule) cells(outputSupported bool) []*Rule {
 	var out []*Rule
 	for _, d := range dirs {
 		for _, p := range expandProtocols(d) {
-			for _, fam := range expandFamilies(p) {
+			for _, fam := range filterFamiliesIPv6(ipv6Supported, p) {
 				out = append(out, expandPorts(fam)...)
 			}
 		}
@@ -995,9 +998,10 @@ func (r *Rule) cells(outputSupported bool) []*Rule {
 }
 
 // coveredBy is the coverage relation behind CoveredBy, with the direction axis
-// gated on whether the backend distinguishes output rules at all.
-func (r *Rule) coveredBy(rules []*Rule, outputSupported bool) bool {
-	for _, cell := range r.cells(outputSupported) {
+// gated on whether the backend distinguishes output rules at all and the family
+// axis on whether it manages IPv6 (see cells).
+func (r *Rule) coveredBy(rules []*Rule, outputSupported, ipv6Supported bool) bool {
+	for _, cell := range r.cells(outputSupported, ipv6Supported) {
 		covered := false
 		for _, have := range rules {
 			if have.covers(cell, outputSupported) {
@@ -1029,7 +1033,7 @@ func (r *Rule) coveredBy(rules []*Rule, outputSupported bool) bool {
 // is not reported present when only its TCP half is, and a port-list rule is not
 // reported present when only some of its ports are. The receiver is not modified.
 func (r *Rule) CoveredBy(rules []*Rule) bool {
-	return r.coveredBy(rules, true)
+	return r.coveredBy(rules, true, true)
 }
 
 // MatchesAny reports whether the receiver is the same underlying rule as any of
@@ -1939,17 +1943,20 @@ type Manager interface {
 // a DirAny rule as an inbound row plus an outbound row, while nftables holds either
 // as one row. An existing rule is kept when every concrete cell it spans is wanted
 // (Rule.CoveredBy over desired), and a desired rule is added when some cell it spans
-// is not yet present (its CoveredBy over existing). Comparing this way keeps Sync a
-// no-op against its own output whichever representation the backend chose, where
-// plain equality would remove-and-re-add every fanned-out rule on each run. A rule
-// only partially covered by desired is removed whole and the wanted part re-added.
+// is not yet present (its CoveredBy over existing). On a backend that does not
+// manage IPv6 (Capabilities.IPv6 false) a family-agnostic rule is compared on its
+// IPv4 half alone, since that is all such a backend stores for it. Comparing this
+// way keeps Sync a no-op against its own output whichever representation the
+// backend chose, where plain equality would remove-and-re-add every fanned-out
+// rule on each run. A rule only partially covered by desired is removed whole and
+// the wanted part re-added.
 // The Comment, HasPrefix and Packets/Bytes fields never affect the diff.
 func Sync(ctx context.Context, mgr Manager, zoneName string, desired []*Rule) (added, removed int, err error) {
 	existing, err := mgr.GetRules(ctx, zoneName)
 	if err != nil {
 		return 0, 0, err
 	}
-	outputSupported := mgr.Capabilities().Output
+	caps := mgr.Capabilities()
 
 	// Remove any existing rule desired does not fully cover. Sync reconciles the
 	// actual firewall state toward desired, so any rule the backend reports and can
@@ -1958,7 +1965,7 @@ func Sync(ctx context.Context, mgr Manager, zoneName string, desired []*Rule) (a
 	// across several desired rules is still fully wanted and is kept.
 	kept := make([]*Rule, 0, len(existing))
 	for _, e := range existing {
-		if e.coveredBy(desired, outputSupported) {
+		if e.coveredBy(desired, caps.Output, caps.IPv6) {
 			kept = append(kept, e)
 			continue
 		}
@@ -1974,7 +1981,7 @@ func Sync(ctx context.Context, mgr Manager, zoneName string, desired []*Rule) (a
 	// as present too: adding a covered duplicate would over-count added.
 	var toAdd []*Rule
 	for _, d := range desired {
-		if d.coveredBy(kept, outputSupported) || d.coveredBy(toAdd, outputSupported) {
+		if d.coveredBy(kept, caps.Output, caps.IPv6) || d.coveredBy(toAdd, caps.Output, caps.IPv6) {
 			continue
 		}
 		toAdd = append(toAdd, d)

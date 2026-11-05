@@ -149,7 +149,7 @@ func TestAllThreeAxesCoverage(t *testing.T) {
 	require.Len(t, rows, 8)
 
 	want := &Rule{Family: FamilyAny, Proto: TCPUDP, Port: 53, Direction: DirAny, Action: Accept}
-	require.Len(t, want.cells(true), 8, "the rule spans eight concrete cells")
+	require.Len(t, want.cells(true, true), 8, "the rule spans eight concrete cells")
 	require.True(t, want.CoveredBy(rows), "the eight rows cover the rule")
 
 	for i := range rows {
@@ -160,7 +160,7 @@ func TestAllThreeAxesCoverage(t *testing.T) {
 	// An address pins the family, so the same rule then spans only four cells: the
 	// direction swap moves it to the destination, and both halves stay IPv4.
 	addressed := &Rule{Proto: TCPUDP, Source: "192.0.2.1", Port: 53, Direction: DirAny, Action: Accept}
-	require.Len(t, addressed.cells(true), 4, "an IPv4 source pins the family axis")
+	require.Len(t, addressed.cells(true, true), 4, "an IPv4 source pins the family axis")
 }
 
 // The port axis is a merged axis like family/transport/direction: a list rule
@@ -175,7 +175,7 @@ func TestPortAxisCoverage(t *testing.T) {
 		{Family: IPv4, Proto: TCP, Port: 443, Action: Accept},
 	}
 
-	require.Len(t, list.cells(true), 2, "a two-port list spans two cells")
+	require.Len(t, list.cells(true, true), 2, "a two-port list spans two cells")
 	require.True(t, list.CoveredBy(rows), "single-port rows cover the list rule")
 	require.True(t, list.Covers(rows[0]), "the list covers each single-port row")
 	require.False(t, rows[0].Covers(list), "coverage is asymmetric: a single port cannot cover the list")
@@ -194,7 +194,7 @@ func TestPortAxisCoverage(t *testing.T) {
 	// cells (two transports times two ports, family pinned), and every one must
 	// be covered.
 	both := &Rule{Family: IPv4, Proto: TCPUDP, Ports: []PortRange{{Start: 80, End: 80}, {Start: 443, End: 443}}, Action: Accept}
-	require.Len(t, both.cells(true), 4)
+	require.Len(t, both.cells(true, true), 4)
 	require.True(t, both.CoveredBy([]*Rule{
 		{Proto: TCP, Port: 80, Action: Accept},
 		{Proto: TCP, Port: 443, Action: Accept},
@@ -203,7 +203,7 @@ func TestPortAxisCoverage(t *testing.T) {
 
 	// Source ports expand independently of destination ports.
 	src := &Rule{Family: IPv4, Proto: TCP, SourcePorts: []PortRange{{Start: 1024, End: 1024}, {Start: 2048, End: 2048}}, Action: Accept}
-	require.Len(t, src.cells(true), 2)
+	require.Len(t, src.cells(true, true), 2)
 	require.True(t, src.CoveredBy([]*Rule{
 		{Proto: TCP, SourcePort: 1024, Action: Accept},
 		{Proto: TCP, SourcePort: 2048, Action: Accept},

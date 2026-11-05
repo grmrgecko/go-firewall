@@ -1532,3 +1532,26 @@ func TestIPTablesRemoveRuleRefusesContainerRuntime(t *testing.T) {
 	require.Contains(t, string(out), "-A FORWARD -i docker0 -o docker0 -j ACCEPT",
 		"Docker's rule must survive an exact-match removal attempt")
 }
+
+// TestIPTablesSyncIPv4OnlyIsStable pins that Sync settles on a host that does not
+// manage IPv6: a family-agnostic rule can only be stored as its IPv4 row there, so
+// a second Sync of the same desired set must add and remove nothing.
+func TestIPTablesSyncIPv4OnlyIsStable(t *testing.T) {
+	dir := t.TempDir()
+	p4 := filepath.Join(dir, "iptables")
+	require.NoError(t, os.WriteFile(p4, []byte("*filter\n:INPUT ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\nCOMMIT\n"), 0o644))
+	f := &IPTables{IP4Path: p4}
+	require.False(t, f.Capabilities().IPv6)
+
+	ctx := context.Background()
+	desired := []*Rule{{Direction: DirInput, Proto: TCP, Ports: []PortRange{{Start: 8443, End: 8443}, {Start: 8480, End: 8480}}, Action: Accept}}
+	added, removed, err := Sync(ctx, f, "", desired)
+	require.NoError(t, err)
+	require.Equal(t, 1, added)
+	require.Zero(t, removed)
+
+	added, removed, err = Sync(ctx, f, "", desired)
+	require.NoError(t, err)
+	require.Zero(t, added, "the IPv4 row is all an IPv4-only host stores for the rule")
+	require.Zero(t, removed)
+}

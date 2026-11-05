@@ -553,6 +553,9 @@ func runManagerSuite(t *testing.T, mgr Manager, reconstruct func(context.Context
 		// FamilyWithoutAddress (wf cannot pin a family without an address).
 		runSplit := func(t *testing.T, c splitCase) {
 			requireCap(t, caps.FamilyWithoutAddress)
+			// Each family must survive the other's removal, so the backend must
+			// manage IPv6 at all (apf/csf with their own IPv6 handling off do not).
+			requireCap(t, caps.IPv6)
 			coverage := func() (v4Cov, v6Cov bool) {
 				for _, r := range rulesOf(t, ctx, mgr, zone) {
 					if !c.match(r) {
@@ -2207,8 +2210,10 @@ func portSetMatches(rule, r *Rule) bool {
 // one row per port (firewalld, pf), or coalesce adjacent discrete ports into a
 // range (ufw). GetRules reports whichever rows the backend actually holds, so
 // the read-back is checked by coverage: the rows must cover the rule and none
-// may widen it. Re-adding must not duplicate, and one remove must clear every
-// row the rule spans.
+// may widen it. Coverage honors the backend's capabilities as Sync does, so a
+// family-agnostic rule on a backend that does not manage IPv6 is covered by its
+// IPv4 rows. Re-adding must not duplicate, and one remove must clear every row
+// the rule spans.
 func roundTripPortSet(t *testing.T, ctx context.Context, mgr Manager, zone string, rule *Rule) {
 	t.Helper()
 	match := func(r *Rule) bool { return portSetMatches(rule, r) }
@@ -2233,7 +2238,8 @@ func roundTripPortSet(t *testing.T, ctx context.Context, mgr Manager, zone strin
 
 	got := found()
 	require.NotEmpty(t, got, "the rule must read back")
-	require.True(t, rule.CoveredBy(got), "the stored rows must cover every port, got %+v", got)
+	caps := mgr.Capabilities()
+	require.True(t, rule.coveredBy(got, caps.Output, caps.IPv6), "the stored rows must cover every port, got %s", dumpRules(got))
 	for _, r := range got {
 		require.True(t, rule.Covers(r), "a stored row must not widen the rule: %+v", r)
 	}
