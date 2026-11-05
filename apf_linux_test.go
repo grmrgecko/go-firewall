@@ -796,3 +796,75 @@ func TestAPFCountableRulesSpansFamilies(t *testing.T) {
 	require.EqualValues(t, 5, dual.Packets)
 	require.EqualValues(t, 340, dual.Bytes)
 }
+
+// TestAPFKeepsFileHeader pins a real loss on Nexcess and EL6 hosts: APF's stock
+// deny_hosts.rules opens with a framed comment block directly above the first entry.
+// Removing that entry deleted the whole header, because the block read as the entry's
+// comment. A comment apf -d wrote below the frame is still the entry's, and goes with it.
+func TestAPFKeepsFileHeader(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "deny_hosts.rules")
+	fw := &APF{rulePrefix: "myapp"}
+	header := "##\n# deny_hosts: addresses to deny\n##\n"
+	require.NoError(t, os.WriteFile(path, []byte(header+"# added by apf\n192.0.2.5\n# why\n192.0.2.6\n"), 0644))
+
+	rules, err := fw.ParseIPList(path, Drop)
+	require.NoError(t, err)
+	require.Len(t, rules, 2)
+	require.Equal(t, "added by apf", rules[0].Comment, "the frame ends the header")
+	require.Equal(t, "why", rules[1].Comment, "a comment above a later rule still attaches")
+
+	require.NoError(t, fw.EditIPList(context.Background(), path, Drop, rules[0], true))
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, header+"# why\n192.0.2.6\n", string(got), "only the rule and its own comment go")
+}
+
+// TestAPFKeepsUnframedFirstComment pins the other side of the header split: a comment
+// above the first rule with no framing line is that rule's comment. It must read back,
+// and go with the rule, or a removal leaves it stray and an empty prefix never round trips.
+func TestAPFKeepsUnframedFirstComment(t *testing.T) {
+	const contents = "# blocked for abuse\n192.0.2.5\n"
+	for _, prefix := range []string{"", "myapp"} {
+		t.Run("prefix="+prefix, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "deny_hosts.rules")
+			fw := &APF{rulePrefix: prefix}
+			require.NoError(t, os.WriteFile(path, []byte(contents), 0644))
+
+			rules, err := fw.ParseIPList(path, Drop)
+			require.NoError(t, err)
+			require.Len(t, rules, 1)
+			require.Equal(t, "blocked for abuse", rules[0].Comment)
+
+			require.NoError(t, fw.EditIPList(context.Background(), path, Drop, rules[0], true))
+			got, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.Empty(t, string(got), "the comment goes with its rule")
+
+			if prefix != "" {
+				return
+			}
+			require.NoError(t, fw.EditIPList(context.Background(), path, Drop, rules[0], false))
+			got, err = os.ReadFile(path)
+			require.NoError(t, err)
+			require.Equal(t, contents, string(got), "the rule round trips")
+		})
+	}
+}
+
+// TestAPFCommentAfterBlankAttaches pins that a block below a blank line doesn't open the
+// file, so a framing line in it doesn't make it a header.
+func TestAPFCommentAfterBlankAttaches(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "deny_hosts.rules")
+	fw := &APF{rulePrefix: "myapp"}
+	require.NoError(t, os.WriteFile(path, []byte("# file notes\n\n#\n# why\n192.0.2.5\n"), 0644))
+
+	rules, err := fw.ParseIPList(path, Drop)
+	require.NoError(t, err)
+	require.Len(t, rules, 1)
+	require.Equal(t, "why", rules[0].Comment)
+
+	require.NoError(t, fw.EditIPList(context.Background(), path, Drop, rules[0], true))
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "# file notes\n\n", string(got))
+}

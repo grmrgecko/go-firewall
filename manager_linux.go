@@ -94,6 +94,9 @@ func scanCommentGroups(fd *os.File, rulePrefix string, attach func(trimmed strin
 	// parse needs it).
 	var pending []string
 	var pendingText string
+	// seenLine records that a non-comment line has passed, so only a block that really
+	// opens the file is checked for a header.
+	var seenLine bool
 	flush := func() error {
 		for _, c := range pending {
 			if err := fn(commentGroup{raw: []string{c}}); err != nil {
@@ -135,8 +138,27 @@ func scanCommentGroups(fd *os.File, rulePrefix string, attach func(trimmed strin
 			if err := fn(commentGroup{raw: []string{raw}}); err != nil {
 				return err
 			}
+			seenLine = true
 			continue
 		}
+
+		// A framed comment block opening the file is the file's header, not a comment on
+		// its first rule, or removing that rule would delete the header with it. APF's
+		// stock deny_hosts.rules and csf.deny open this way. The header runs through its
+		// last framing line (## or #), and anything below that is the rule's comment. An
+		// unframed block is an ordinary rule comment, and the library's own tagged
+		// comments always attach.
+		if !seenLine && pendingText != "" && !prefixedLeader(rulePrefix, pendingText) {
+			held := headerEnd(pending)
+			for _, c := range pending[:held] {
+				if err := fn(commentGroup{raw: []string{c}}); err != nil {
+					return err
+				}
+			}
+			pending = pending[held:]
+			pendingText = commentText(pending)
+		}
+		seenLine = true
 
 		g := commentGroup{raw: append(pending, raw), line: trimmed, comment: pendingText}
 		pending, pendingText = nil, ""
@@ -158,6 +180,34 @@ func trimInlineComment(line string) string {
 		line = line[:ci]
 	}
 	return strings.TrimSpace(line)
+}
+
+// headerEnd returns how many of a file's opening comment lines are its header: through
+// the last line of only # characters, or none when there's no such line.
+func headerEnd(lines []string) int {
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.Trim(strings.TrimSpace(lines[i]), "#") == "" {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+// commentText joins raw comment lines into a comment's text.
+func commentText(lines []string) string {
+	var parts []string
+	for _, l := range lines {
+		if text := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(l), "#")); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// prefixedLeader reports whether a comment carries the configured prefix.
+func prefixedLeader(prefix, comment string) bool {
+	_, ok := prefixedComment(prefix, comment)
+	return ok
 }
 
 // prefixedComment splits a stored comment into its user-facing text and whether
