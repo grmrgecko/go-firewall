@@ -81,7 +81,7 @@ func foreignSeeder(mgr Manager) func(zone string) (*foreignSeed, error) {
 			cmds := [][]string{
 				{"add", "table", "ip", table},
 				{"add", "chain", "ip", table, "input", "{", "type", "filter", "hook", "input", "priority", "0", ";", "policy", "accept", ";", "}"},
-				{"add", "rule", "ip", table, "input", "ip", "saddr", "192.0.2.10", "tcp", "dport", "8123", "accept"},
+				{"add", "rule", "ip", table, "input", "ip", "saddr", "192.0.2.10", "tcp", "dport", "8100-8200", "accept"},
 			}
 			for _, c := range cmds {
 				if out, err := exec.Command("nft", c...).CombinedOutput(); err != nil {
@@ -90,8 +90,9 @@ func foreignSeeder(mgr Manager) func(zone string) (*foreignSeed, error) {
 				}
 			}
 			return &foreignSeed{
-				rule:    &Rule{Family: IPv4, Source: "192.0.2.10", Proto: TCP, Port: 8123, Action: Accept},
+				rule:    &Rule{Family: IPv4, Source: "192.0.2.10", Proto: TCP, Ports: []PortRange{{Start: 8100, End: 8200}}, Action: Accept},
 				inScope: false, // nft reports foreign tables but writes only to its own.
+				narrow:  &Rule{Family: IPv4, Source: "192.0.2.10", Proto: TCP, Port: 8123, Action: Accept},
 				undo:    func() { _ = exec.Command("nft", "delete", "table", "ip", table).Run() },
 			}, nil
 		}
@@ -148,6 +149,34 @@ func foreignSeeder(mgr Manager) func(zone string) (*foreignSeed, error) {
 		}
 	}
 	return nil
+}
+
+// foreignNATSeeder returns a function seeding a DNAT rule into a foreign nftables
+// table, or nil for every other Linux backend: only nft reports NAT rules from
+// outside the tables it writes to.
+func foreignNATSeeder(mgr Manager) func() (*foreignNATSeed, error) {
+	if mgr.Type() != NFTType {
+		return nil
+	}
+	return func() (*foreignNATSeed, error) {
+		const table = "foreignnatseed"
+		undo := func() { _ = exec.Command("nft", "delete", "table", "ip", table).Run() }
+		cmds := [][]string{
+			{"add", "table", "ip", table},
+			{"add", "chain", "ip", table, "prerouting", "{", "type", "nat", "hook", "prerouting", "priority", "-100", ";", "}"},
+			{"add", "rule", "ip", table, "prerouting", "tcp", "dport", "8124", "dnat", "to", "192.0.2.20:80"},
+		}
+		for _, c := range cmds {
+			if out, err := exec.Command("nft", c...).CombinedOutput(); err != nil {
+				undo()
+				return nil, fmt.Errorf("nft %s: %v: %s", strings.Join(c, " "), err, out)
+			}
+		}
+		return &foreignNATSeed{
+			rule: &NATRule{Kind: DNAT, Family: IPv4, Proto: TCP, Port: 8124, ToAddress: "192.0.2.20", ToPort: 80},
+			undo: undo,
+		}, nil
+	}
 }
 
 // foreignMACSeeder returns a function seeding a foreign MAC zone source with the

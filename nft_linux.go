@@ -2422,21 +2422,28 @@ func (f *NFT) MoveRule(ctx context.Context, zoneName string, r *Rule, position i
 	return c.Flush()
 }
 
-// RemoveRule removes a rule from the zone.
+// RemoveRule removes a rule from the zone. A target that matches nothing in the
+// library's own table but matches a rule in another table returns
+// ErrForeignTable: GetRules reports that rule, but this backend writes only to
+// its own table, so the rule is left in place. Foreign rules are deliberately not
+// deleted by handle: Sync removes every reported rule outside the desired set, so
+// that would wipe every other table on the host, and a foreign rule is parsed
+// best-effort, so its handle may carry more than the parsed Rule shows.
 func (f *NFT) RemoveRule(ctx context.Context, zoneName string, r *Rule) error {
 	if err := f.ensureTable(ctx); err != nil {
 		return err
 	}
 
 	// A DirAny target removes both its input row and its role-swapped output row,
-	// each from its own chain.
+	// each from its own chain. Both halves run even when one fails, so a foreign
+	// input row cannot stop the output row in our own table from being removed;
+	// the joined error keeps errors.Is working on each half's error.
 	if r.Direction == DirAny {
+		var errs []error
 		for _, sub := range expandDirections(r) {
-			if err := f.RemoveRule(ctx, zoneName, sub); err != nil {
-				return err
-			}
+			errs = append(errs, f.RemoveRule(ctx, zoneName, sub))
 		}
-		return nil
+		return errors.Join(errs...)
 	}
 
 	// Verify the rule is valid for nftables. Only the encoding paths run
@@ -2452,7 +2459,8 @@ func (f *NFT) RemoveRule(ctx context.Context, zoneName string, r *Rule) error {
 		return err
 	}
 	chain := f.chainForDirection(r.Direction)
-	rules, handles, err := f.listChain(c, newSetReader(c), chain)
+	sets := newSetReader(c)
+	rules, handles, err := f.listChain(c, sets, chain)
 	if err != nil {
 		return err
 	}
@@ -2461,8 +2469,23 @@ func (f *NFT) RemoveRule(ctx context.Context, zoneName string, r *Rule) error {
 	// target clears both transports. A concrete-family target still removes only its
 	// own family — see EqualForRemoval; removeCovered re-adds each merged row's
 	// untargeted remainder in the row's own slot.
-	_, err = f.removeCovered(c, chain, rules, handles, r)
-	return err
+	deleted, err := f.removeCovered(c, chain, rules, handles, r)
+	if err != nil || deleted {
+		return err
+	}
+
+	// Nothing in our table matched. Removing an absent rule stays a no-op, but a
+	// target that GetRules reports from another table must not read as removed.
+	foreign, err := f.listForeignRules(c, sets)
+	if err != nil {
+		return err
+	}
+	for _, e := range foreign {
+		if e.EqualForRemoval(r, true) {
+			return fmt.Errorf("%w: nftables table %s", ErrForeignTable, e.table)
+		}
+	}
+	return nil
 }
 
 // -----------------------------------------------------------------------------
@@ -2680,7 +2703,8 @@ func (f *NFT) RemoveNATRule(ctx context.Context, zoneName string, r *NATRule) er
 	if err != nil {
 		return err
 	}
-	rules, handles, err := f.listNATChain(c, newSetReader(c), chain)
+	sets := newSetReader(c)
+	rules, handles, err := f.listNATChain(c, sets, chain)
 	if err != nil {
 		return err
 	}
@@ -2690,8 +2714,23 @@ func (f *NFT) RemoveNATRule(ctx context.Context, zoneName string, r *NATRule) er
 	// that matched a genuine dual-family row re-adds the untargeted family in the
 	// row's slot, so a bare masquerade/redirect does not silently stop translating
 	// the other family.
-	_, err = f.removeCoveredNAT(c, chain, rules, handles, r)
-	return err
+	deleted, err := f.removeCoveredNAT(c, chain, rules, handles, r)
+	if err != nil || deleted {
+		return err
+	}
+
+	// Nothing in our table matched. As in RemoveRule, an absent rule is a no-op but
+	// a target GetNATRules reports from another table must not read as removed.
+	foreign, err := f.listForeignNATRules(c, sets)
+	if err != nil {
+		return err
+	}
+	for _, e := range foreign {
+		if e.EqualForRemoval(r) {
+			return fmt.Errorf("%w: nftables table %s", ErrForeignTable, e.table)
+		}
+	}
+	return nil
 }
 
 // -----------------------------------------------------------------------------

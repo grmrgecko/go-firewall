@@ -32,6 +32,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -58,12 +59,26 @@ type foreignSeed struct {
 	// foreign nft table, true on firewalld, whose container is the zone itself, so
 	// every rule read from it carries the flag.
 	hasPrefix bool
-	// inScope reports whether the backend's mutations reach the seeded rule.
-	// Everything but a foreign nft table is in scope; nft reports foreign tables
-	// but scopes its writes to its own, so RemoveRule must no-op there without
-	// error (Sync relies on exactly that).
+	// inScope reports whether the backend's mutations reach the seeded rule. A
+	// foreign nft table and a foreign pf anchor are out of scope: the backend
+	// reports them but writes only to its own table or anchor, so RemoveRule
+	// refuses them with ErrForeignTable and Sync skips them.
 	inScope bool
+	// narrow is a rule the seed covers but which does not cover the seed, set only
+	// for an out-of-scope seed. Sync must still add it to the backend's own table
+	// or anchor: a foreign rule elsewhere does not stand in for one of ours.
+	narrow *Rule
 	// undo unseeds, best effort — the suite's RemoveRule normally already has.
+	undo func()
+}
+
+// foreignNATSeed is a translation rule planted out of band in a table or anchor the
+// backend reports but does not write to. Each platform's foreignNATSeeder produces
+// one; see integration_linux_test.go.
+type foreignNATSeed struct {
+	// rule is what GetNATRules should report for the seeded rule.
+	rule *NATRule
+	// undo unseeds, best effort.
 	undo func()
 }
 
@@ -216,13 +231,67 @@ func runManagerSuite(t *testing.T, mgr Manager, reconstruct func(context.Context
 			"HasPrefix must reflect how the backend namespaces its rules (informational only, never an ownership filter)")
 
 		if !seed.inScope {
-			// Reported but outside the backend's mutation scope (a foreign nft
-			// table): RemoveRule must no-op without error and leave the rule alone,
-			// or Sync would fail hard on every reconcile that sees it.
-			require.NoError(t, mgr.RemoveRule(ctx, zone, seed.rule),
-				"removing a reported out-of-scope rule must no-op, not error")
+			// Reported but outside the backend's mutation scope (a foreign nft table
+			// or pf anchor): RemoveRule must say so rather than report a removal that
+			// did not happen, and must leave the rule alone.
+			err := mgr.RemoveRule(ctx, zone, seed.rule)
+			require.ErrorIs(t, err, ErrForeignTable,
+				"removing a reported out-of-scope rule must return ErrForeignTable, got %v", err)
 			require.True(t, containsRule(rulesOf(t, ctx, mgr, zone), seed.rule, caps.Output),
-				"an out-of-scope foreign rule must survive the no-op removal")
+				"an out-of-scope foreign rule must survive the refused removal")
+
+			// A DirAny target whose input half is the foreign seed and whose output
+			// half is in the backend's own table or anchor: the own half is removed
+			// and the foreign half still reports ErrForeignTable.
+			if caps.Output {
+				both := *seed.rule
+				both.Direction = DirAny
+				var own *Rule
+				for _, half := range expandDirections(&both) {
+					if half.Direction == DirOutput {
+						own = half
+					}
+				}
+				require.NotNil(t, own, "a DirAny rule must expand to an output half")
+				require.NoError(t, mgr.AddRule(ctx, zone, own))
+				t.Cleanup(func() { _ = mgr.RemoveRule(context.Background(), zone, own) })
+				err = mgr.RemoveRule(ctx, zone, &both)
+				assert.ErrorIs(t, err, ErrForeignTable,
+					"a DirAny target with a foreign half must report it, got %v", err)
+				rules := rulesOf(t, ctx, mgr, zone)
+				assert.False(t, containsRule(rules, own, caps.Output),
+					"the output half in the backend's own table must be removed despite the foreign input half")
+				assert.True(t, containsRule(rules, seed.rule, caps.Output),
+					"the foreign input half must survive")
+			}
+
+			// Removing a rule that exists nowhere stays an idempotent no-op.
+			absent := &Rule{Family: IPv4, Source: "192.0.2.99", Proto: TCP, Port: 8999, Action: Accept}
+			require.NoError(t, mgr.RemoveRule(ctx, zone, absent),
+				"removing an absent rule must no-op, not error")
+
+			// Sync toward a desired set that omits the seed but wants a narrower rule
+			// the seed covers. The seed is skipped, not counted as removed, and does
+			// not count as covering the narrow rule, so the narrow rule lands in the
+			// backend's own table or anchor.
+			var desired []*Rule
+			for _, r := range rulesOf(t, ctx, mgr, zone) {
+				if !r.EqualBase(seed.rule, caps.Output) {
+					desired = append(desired, r)
+				}
+			}
+			desired = append(desired, seed.narrow)
+			t.Cleanup(func() { _ = mgr.RemoveRule(context.Background(), zone, seed.narrow) })
+			added, removed, err := Sync(ctx, mgr, zone, desired)
+			require.NoError(t, err, "Sync must skip an out-of-scope rule, not fail on it")
+			assert.Zero(t, removed, "a skipped out-of-scope rule must not count as removed")
+			assert.Equal(t, 1, added, "the narrow rule must be added despite the broader foreign rule")
+			assert.True(t, containsRule(rulesOf(t, ctx, mgr, zone), seed.rule, caps.Output),
+				"Sync must leave the out-of-scope rule in place")
+			got := findRule(t, ctx, mgr, zone, seed.narrow)
+			assert.True(t, got.HasPrefix, "the narrow rule must land in the backend's own table or anchor")
+			require.NoError(t, mgr.RemoveRule(ctx, zone, seed.narrow),
+				"the narrow rule lives in the backend's own table and must be removable")
 			return
 		}
 		require.NoError(t, mgr.RemoveRule(ctx, zone, seed.rule),
@@ -2072,6 +2141,54 @@ func runManagerSuite(t *testing.T, mgr Manager, reconstruct func(context.Context
 		require.False(t, containsRule(rulesOf(t, ctx, mgr, zoneB), r, caps.Output), "rule should be gone from zone %q", zoneB)
 		require.True(t, containsRule(rulesOf(t, ctx, mgr, zoneA), r, caps.Output),
 			"removing the rule from zone %q must not delete the copy in zone %q", zoneB, zoneA)
+	})
+
+	t.Run("foreignnat", func(t *testing.T) {
+		// The NAT half of the out-of-scope contract in foreignrule: a translation rule
+		// in a table or anchor the backend reports but does not write to must not
+		// read as removed.
+		requireCap(t, caps.NAT)
+		seeder := foreignNATSeeder(mgr)
+		if seeder == nil {
+			t.Skip("no out-of-scope NAT seeder for this backend")
+		}
+		seed, err := seeder()
+		if err != nil {
+			t.Skipf("could not seed a foreign NAT rule: %v", err)
+		}
+		t.Cleanup(seed.undo)
+
+		require.True(t, containsNAT(natRulesOf(t, ctx, mgr, zone), seed.rule),
+			"a NAT rule seeded out of band must surface in GetNATRules, got %+v", natRulesOf(t, ctx, mgr, zone))
+
+		err = mgr.RemoveNATRule(ctx, zone, seed.rule)
+		require.ErrorIs(t, err, ErrForeignTable,
+			"removing a reported out-of-scope NAT rule must return ErrForeignTable, got %v", err)
+		require.True(t, containsNAT(natRulesOf(t, ctx, mgr, zone), seed.rule),
+			"an out-of-scope NAT rule must survive the refused removal")
+
+		absent := &NATRule{Kind: DNAT, Family: IPv4, Proto: TCP, Port: 8999, ToAddress: "192.0.2.99", ToPort: 80}
+		require.NoError(t, mgr.RemoveNATRule(ctx, zone, absent),
+			"removing an absent NAT rule must no-op, not error")
+
+		// An identical rule in the backend's own table or anchor is the one removed:
+		// the removal succeeds and the foreign copy is left alone.
+		require.NoError(t, mgr.AddNATRule(ctx, zone, seed.rule))
+		t.Cleanup(func() { _ = mgr.RemoveNATRule(context.Background(), zone, seed.rule) })
+		own := 0
+		for _, r := range natRulesOf(t, ctx, mgr, zone) {
+			if r.EqualBase(seed.rule) && r.HasPrefix {
+				own++
+			}
+		}
+		require.Equal(t, 1, own, "AddNATRule must write its own copy beside the foreign rule")
+		require.NoError(t, mgr.RemoveNATRule(ctx, zone, seed.rule),
+			"a NAT rule in the backend's own table must be removable while a foreign copy exists")
+		rules := natRulesOf(t, ctx, mgr, zone)
+		for _, r := range rules {
+			assert.False(t, r.EqualBase(seed.rule) && r.HasPrefix, "the backend's own copy must be removed")
+		}
+		assert.True(t, containsNAT(rules, seed.rule), "the foreign copy must survive")
 	})
 
 	t.Run("foreignmacsource", func(t *testing.T) {

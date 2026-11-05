@@ -1462,9 +1462,42 @@ func (f *PF) removeRows(rules []*Rule, raw []string, cells []*Rule) ([]string, b
 
 // RemoveRule removes a rule from the zone. The cells are the inverse of the add
 // fan-out: EqualForRemoval matches ports exactly, so a port-list target clears the
-// per-spec rows AddRule wrote for it.
+// per-spec rows AddRule wrote for it. A target cell that matches nothing in the
+// library's anchor but matches a rule in the main ruleset or another anchor
+// returns ErrForeignTable: GetRules reports that rule, but this backend writes
+// only to its own anchor, so the rule is left in place. The cells that did match
+// the anchor are still removed.
 func (f *PF) RemoveRule(ctx context.Context, zoneName string, r *Rule) error {
-	return f.editAnchor(ctx, r, f.removeRows)
+	var unmatched []*Rule
+	err := f.editAnchor(ctx, r, func(rules []*Rule, raw []string, cells []*Rule) ([]string, bool, error) {
+		for _, cell := range cells {
+			hit := false
+			for _, e := range rules {
+				if e != nil && e.EqualForRemoval(cell, true) {
+					hit = true
+					break
+				}
+			}
+			if !hit {
+				unmatched = append(unmatched, cell)
+			}
+		}
+		return f.removeRows(rules, raw, cells)
+	})
+	if err != nil || len(unmatched) == 0 {
+		return err
+	}
+
+	// Some cells matched nothing in our anchor. Removing an absent rule stays a
+	// no-op, but a cell GetRules reports from elsewhere must not read as removed.
+	for _, e := range f.listForeignRules(ctx) {
+		for _, cell := range unmatched {
+			if e.EqualForRemoval(cell, true) {
+				return fmt.Errorf("%w: pf %s", ErrForeignTable, pfLocation(e.table))
+			}
+		}
+	}
+	return nil
 }
 
 // --- NAT rule parsing and anchor reading --------------------------------------
@@ -2029,8 +2062,50 @@ func (f *PF) removeNATRows(rules []*NATRule, raw []string, cells []*NATRule) ([]
 // RemoveNATRule removes a NAT rule from the zone. The cells are the inverse of the
 // add fan-out: EqualForRemoval matches ports exactly, so a match-port list target
 // clears the per-spec rows AddNATRule wrote for it.
+//
+// As in RemoveRule, a cell that matches nothing in the library's anchor but
+// matches a translation rule in the main ruleset or another anchor returns
+// ErrForeignTable, and the cells that did match the anchor are still removed.
 func (f *PF) RemoveNATRule(ctx context.Context, zoneName string, r *NATRule) error {
-	return f.editNATAnchor(ctx, r, f.removeNATRows)
+	var unmatched []*NATRule
+	err := f.editNATAnchor(ctx, r, func(rules []*NATRule, raw []string, cells []*NATRule) ([]string, bool, error) {
+		for _, cell := range cells {
+			hit := false
+			for _, e := range rules {
+				if e != nil && e.EqualForRemoval(cell) {
+					hit = true
+					break
+				}
+			}
+			if !hit {
+				unmatched = append(unmatched, cell)
+			}
+		}
+		return f.removeNATRows(rules, raw, cells)
+	})
+	if err != nil || len(unmatched) == 0 {
+		return err
+	}
+
+	// Some cells matched nothing in our anchor; check them against the rules
+	// GetNATRules reports from elsewhere.
+	for _, e := range f.listForeignNATRules(ctx) {
+		for _, cell := range unmatched {
+			if e.EqualForRemoval(cell) {
+				return fmt.Errorf("%w: pf %s", ErrForeignTable, pfLocation(e.table))
+			}
+		}
+	}
+	return nil
+}
+
+// pfLocation names where a foreign pf rule was read from, for an error message:
+// the main ruleset for an empty table, the named anchor otherwise.
+func pfLocation(table string) string {
+	if table == "" {
+		return "main ruleset"
+	}
+	return "anchor " + table
 }
 
 // --- default policy -----------------------------------------------------------

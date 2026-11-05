@@ -48,6 +48,13 @@ var (
 	// ErrUnsupportedForward is returned when a backend cannot express a rule in
 	// the forward (routing) chain.
 	ErrUnsupportedForward = fmt.Errorf("%w: forward-chain rules", ErrUnsupported)
+	// ErrForeignTable is returned by RemoveRule and RemoveNATRule when the target
+	// matches no rule in the backend's own table or anchor but does match a rule
+	// GetRules or GetNATRules reports from another one (a foreign nftables table,
+	// the pf main ruleset or another pf anchor). The backend writes only to its
+	// own, so the rule is still in place. Sync skips such a rule instead of failing
+	// or counting it as removed.
+	ErrForeignTable = errors.New("rule is outside this backend's own table or anchor")
 )
 
 // unsupportedNAT is the error a backend returns from its NAT methods when its
@@ -1960,9 +1967,12 @@ func Sync(ctx context.Context, mgr Manager, zoneName string, desired []*Rule) (a
 
 	// Remove any existing rule desired does not fully cover. Sync reconciles the
 	// actual firewall state toward desired, so any rule the backend reports and can
-	// act on is fair game; backends whose mutations are scoped to a private
-	// table/anchor simply no-op on rules outside it. A rule whose cells are spread
-	// across several desired rules is still fully wanted and is kept.
+	// act on is fair game. A backend whose mutations are scoped to a private
+	// table/anchor refuses a rule outside it with ErrForeignTable; that rule is
+	// skipped, not counted as removed, and not kept, so it never counts as covering
+	// a desired rule — a broad accept in another nftables table does not stop this
+	// table from dropping the packet. A rule whose cells are spread across several
+	// desired rules is still fully wanted and is kept.
 	kept := make([]*Rule, 0, len(existing))
 	for _, e := range existing {
 		if e.coveredBy(desired, caps.Output, caps.IPv6) {
@@ -1970,6 +1980,9 @@ func Sync(ctx context.Context, mgr Manager, zoneName string, desired []*Rule) (a
 			continue
 		}
 		if err := mgr.RemoveRule(ctx, zoneName, e); err != nil {
+			if errors.Is(err, ErrForeignTable) {
+				continue
+			}
 			return added, removed, err
 		}
 		removed++
