@@ -1197,6 +1197,16 @@ type nftDecoder struct {
 	load expr.Any
 	// mask is a pending bitwise mask applied to the loaded value.
 	mask []byte
+	// portLow is the lower bound of a port range the nft CLI spelled as a
+	// `cmp gte` awaiting its closing `cmp lte`; nil when none is open.
+	portLow *portBound
+}
+
+// portBound is the open lower bound of a port range: its value and whether the
+// load it compared was the source port.
+type portBound struct {
+	port   uint16
+	source bool
 }
 
 // setPort stores a decoded port match, keeping the single-port form for a lone
@@ -1221,6 +1231,9 @@ func (f *NFT) setPort(r *Rule, specs []PortRange, source bool) {
 // applyCmp folds a comparison into the rule, interpreting it against the value
 // the preceding load produced.
 func (d *nftDecoder) applyCmp(r *Rule, c *expr.Cmp) error {
+	if c.Op != expr.CmpOpEq && c.Op != expr.CmpOpNeq {
+		return d.applyPortBound(r, c)
+	}
 	neg := c.Op == expr.CmpOpNeq
 	switch l := d.load.(type) {
 	case *expr.Meta:
@@ -1276,6 +1289,10 @@ func (d *nftDecoder) applyCmp(r *Rule, c *expr.Cmp) error {
 				return fmt.Errorf("unsupported network header offset %d", l.Offset)
 			}
 		case expr.PayloadBaseTransportHeader:
+			// The model has no negated port, so `dport != 22` must not read as port 22.
+			if neg {
+				return fmt.Errorf("unsupported negated transport header match")
+			}
 			switch {
 			case l.Offset == 2 && l.Len == 2:
 				d.f.setPort(r, []PortRange{{Start: binaryutil.BigEndian.Uint16(c.Data), End: binaryutil.BigEndian.Uint16(c.Data)}}, false)
@@ -1392,6 +1409,46 @@ func (d *nftDecoder) applyRange(r *Rule, rg *expr.Range) error {
 	return nil
 }
 
+// applyPortBound folds an ordering comparison into the rule. The nft CLI writes a
+// port range on a plain chain row as `cmp gte` then `cmp lte` on one transport
+// port load rather than as a range expression, so the pair is joined into a
+// single PortRange. Any other ordering comparison has no form in the model.
+func (d *nftDecoder) applyPortBound(r *Rule, c *expr.Cmp) error {
+	l, ok := d.load.(*expr.Payload)
+	if !ok || l.Base != expr.PayloadBaseTransportHeader || l.Len != 2 || (l.Offset != 0 && l.Offset != 2) ||
+		d.mask != nil || len(c.Data) != 2 {
+		return fmt.Errorf("unsupported comparison op %d", c.Op)
+	}
+	port := binaryutil.BigEndian.Uint16(c.Data)
+	source := l.Offset == 0
+	switch c.Op {
+	case expr.CmpOpGte:
+		if d.portLow != nil {
+			return fmt.Errorf("unsupported port comparison")
+		}
+		d.portLow = &portBound{port: port, source: source}
+	case expr.CmpOpLte:
+		if d.portLow == nil || d.portLow.source != source || d.portLow.port > port {
+			return fmt.Errorf("unsupported open-ended port comparison")
+		}
+		d.f.setPort(r, []PortRange{{Start: d.portLow.port, End: port}}, source)
+		d.portLow = nil
+	default:
+		return fmt.Errorf("unsupported comparison op %d", c.Op)
+	}
+	return nil
+}
+
+// finish rejects a row whose decoding left a port range open: a lone `cmp gte`
+// (such as `dport >= 1024`) has no form in the model, and dropping it would read
+// the row as matching every port.
+func (d *nftDecoder) finish() error {
+	if d.portLow != nil {
+		return fmt.Errorf("unsupported open-ended port comparison")
+	}
+	return nil
+}
+
 // applyDynset folds a per-source connection limit into the rule. The dynamic set
 // is keyed on the source address loaded just before it, which is what pins the
 // rule's family.
@@ -1500,6 +1557,9 @@ func (f *NFT) UnmarshalRule(nr *nftables.Rule, chain string, sets *nftSetReader,
 		}
 	}
 
+	if err := d.finish(); err != nil {
+		return nil, err
+	}
 	if r.Action == ActionInvalid {
 		return nil, fmt.Errorf("no valid action was provided")
 	}
@@ -1584,6 +1644,9 @@ func (f *NFT) UnmarshalNATRule(nr *nftables.Rule, sets *nftSetReader, tbl *nftab
 		}
 	}
 
+	if err := d.finish(); err != nil {
+		return nil, err
+	}
 	if r.Kind == NATInvalid {
 		return nil, fmt.Errorf("no nat action was provided")
 	}

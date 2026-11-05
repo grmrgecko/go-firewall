@@ -7,6 +7,7 @@ import (
 	"github.com/google/nftables"
 	"github.com/google/nftables/binaryutil"
 	"github.com/google/nftables/expr"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -345,6 +346,58 @@ func TestNFTUnmodelledRowsRejected(t *testing.T) {
 	for name, exprs := range cases {
 		_, err := f.UnmarshalRule(&nftables.Rule{Exprs: exprs}, "input", sets, f.tableRef())
 		require.Error(t, err, "expected %s to stay opaque", name)
+	}
+}
+
+// TestNFTCLIPortComparisons pins how the nft CLI spells port matches an operator
+// writes by hand, as captured with `nft --debug=netlink add rule ip t input ...`.
+// nft 1.0.9 (Ubuntu 24.04 noble) writes `dport 8100-8200` as `cmp gte` plus
+// `cmp lte` on one load, where nft 1.1.7 writes a single `range eq`; both must
+// read back as the one range, not as the upper bound alone. A negated port, a
+// lone bound and a negated range have no form in the model and must stay opaque
+// rather than read as the port they compare against.
+func TestNFTCLIPortComparisons(t *testing.T) {
+	f := &NFT{table: "go_firewall"}
+	sets := newStagedSetReader()
+	tbl := &nftables.Table{Family: nftables.TableFamilyIPv4, Name: "t"}
+	port := binaryutil.BigEndian.PutUint16
+	dport := &expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2}
+	sport := &expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 0, Len: 2}
+	cmp := func(op expr.CmpOp, p uint16) *expr.Cmp { return &expr.Cmp{Op: op, Register: 1, Data: port(p)} }
+	rng := func(op expr.CmpOp) *expr.Range {
+		return &expr.Range{Op: op, Register: 1, FromData: port(8100), ToData: port(8200)}
+	}
+	span := []PortRange{{Start: 8100, End: 8200}}
+
+	for _, c := range []struct {
+		name        string
+		match       []expr.Any
+		wantPorts   []PortRange
+		wantSrcPort []PortRange
+	}{
+		{name: "nft 1.0.9 dport 8100-8200", match: []expr.Any{dport, cmp(expr.CmpOpGte, 8100), cmp(expr.CmpOpLte, 8200)}, wantPorts: span},
+		{name: "nft 1.0.9 sport 8100-8200", match: []expr.Any{sport, cmp(expr.CmpOpGte, 8100), cmp(expr.CmpOpLte, 8200)}, wantSrcPort: span},
+		{name: "nft 1.1.7 dport 8100-8200", match: []expr.Any{dport, rng(expr.CmpOpEq)}, wantPorts: span},
+		{name: "dport != 22", match: []expr.Any{dport, cmp(expr.CmpOpNeq, 22)}},
+		{name: "nft 1.0.9 dport >= 1024", match: []expr.Any{dport, cmp(expr.CmpOpGte, 1024)}},
+		{name: "nft 1.1.7 dport < 1024", match: []expr.Any{dport, cmp(expr.CmpOpLt, 1024)}},
+		{name: "dport != 8100-8200", match: []expr.Any{dport, rng(expr.CmpOpNeq)}},
+	} {
+		exprs := []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{6}},
+		}
+		exprs = append(exprs, c.match...)
+		exprs = append(exprs, &expr.Verdict{Kind: expr.VerdictAccept})
+		got, err := f.UnmarshalRule(&nftables.Rule{Exprs: exprs}, "input", sets, tbl)
+		if c.wantPorts == nil && c.wantSrcPort == nil {
+			assert.Error(t, err, "%s has no form in the model and must stay opaque", c.name)
+			continue
+		}
+		require.NoError(t, err, c.name)
+		assert.Equal(t, c.wantPorts, got.Ports, "destination range for %s", c.name)
+		assert.Equal(t, c.wantSrcPort, got.SourcePorts, "source range for %s", c.name)
+		assert.Zero(t, got.Port, "%s must not collapse to a single port", c.name)
 	}
 }
 
